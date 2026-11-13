@@ -32,3 +32,31 @@ model Session {
   refreshToken        String?
   refreshTokenExpires DateTime?
 }
+// One unit of sync work, e.g. "send order #1001 to the ERP"
+model SyncJob {
+  id          String    @id @default(cuid())
+  shop        String
+  type        String    // "push_order" | "pull_inventory" | "pull_fulfillments"
+  payload     String    // the job's data, stored as JSON text
+  dedupeKey   String    // same key = same job, so duplicates are ignored
+  status      String    @default("pending") // pending | running | succeeded | dead
+  attempts    Int       @default(0)
+  maxAttempts Int       @default(5)
+  runAt       DateTime  @default(now()) // don't try before this time (backoff)
+  lastError   String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  finishedAt  DateTime?
+
+  @@unique([shop, dedupeKey])
+  @@index([status, runAt])
+}
+
+// Remembers "where we left off", e.g. the last time we checked the ERP for stock changes
+model SyncCursor {
+  shop  String
+  name  String // "inventory" | "fulfillments"
+  value String
+
+  @@id([shop, name])
+}
