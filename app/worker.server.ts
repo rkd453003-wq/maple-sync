@@ -7,6 +7,7 @@ import {
   type JobHandler,
   type JobType,
 } from "./queue.server";
+import { pullInventory } from "./inventory.server";
 
 const TICK_MS = 1_000; // look for due jobs every second
 const SCHEDULE_MS = 60_000; // check the ERP for changes every minute
@@ -14,7 +15,7 @@ const SCHEDULE_MS = 60_000; // check the ERP for changes every minute
 // Placeholders: milestone 4 replaces these with the real sync logic
 const handlers: Record<JobType, JobHandler> = {
   push_order: async ({ payload }) => console.log("📦 (placeholder) push order", payload),
-  pull_inventory: async ({ shop }) => console.log(`📥 (placeholder) pull inventory for ${shop}`),
+  pull_inventory: async ({ shop }) => pullInventory(shop),
   pull_fulfillments: async ({ shop }) => console.log(`🚚 (placeholder) pull fulfillments for ${shop}`),
 };
 
