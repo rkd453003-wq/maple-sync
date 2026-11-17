@@ -191,11 +191,11 @@
           "quantity": 1
         }
       ],
-      "status": "received",
-      "trackingNumber": null,
-      "carrier": null,
+      "status": "shipped",
+      "trackingNumber": "CP143232694335CA",
+      "carrier": "Canada Post",
       "createdAt": "2026-11-17T19:11:08.121Z",
-      "updatedAt": "2026-11-17T19:11:08.121Z"
+      "updatedAt": "2026-11-17T19:20:32.755Z"
     }
   ]
 }

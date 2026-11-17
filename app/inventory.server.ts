@@ -10,10 +10,10 @@ const WAREHOUSE_LOCATIONS: Record<string, string> = {
   "MTL-DC": "My Custom Location",
 };
 
-type Admin = Awaited<ReturnType<typeof unauthenticated.admin>>["admin"];
+export type Admin = Awaited<ReturnType<typeof unauthenticated.admin>>["admin"];
 
 // Small helper: run a GraphQL query and fail loudly if Shopify returns errors
-async function gql<T>(admin: Admin, query: string, variables: Record<string, unknown> = {}) {
+export async function gql<T>(admin: Admin, query: string, variables: Record<string, unknown> = {}) {
   const res = await admin.graphql(query, { variables });
   const json = (await res.json()) as { data?: T; errors?: unknown };
   if (!json.data) throw new Error(`Shopify GraphQL error: ${JSON.stringify(json.errors)}`);
