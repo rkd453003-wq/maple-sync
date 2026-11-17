@@ -75,8 +75,8 @@
     {
       "sku": "ML-DO-CER",
       "warehouse": "TOR-DC",
-      "quantity": 25,
-      "updatedAt": "2026-11-13T19:02:06.713Z"
+      "quantity": 24,
+      "updatedAt": "2026-11-17T19:11:08.121Z"
     },
     {
       "sku": "ML-DO-CER",
@@ -181,5 +181,21 @@
       "updatedAt": "2026-11-13T19:02:06.713Z"
     }
   ],
-  "orders": []
+  "orders": [
+    {
+      "erpOrderId": "ERP-FE16497A",
+      "shopifyOrderId": "gid://shopify/Order/19795324895370",
+      "lines": [
+        {
+          "sku": "ML-DO-CER",
+          "quantity": 1
+        }
+      ],
+      "status": "received",
+      "trackingNumber": null,
+      "carrier": null,
+      "createdAt": "2026-11-17T19:11:08.121Z",
+      "updatedAt": "2026-11-17T19:11:08.121Z"
+    }
+  ]
 }
