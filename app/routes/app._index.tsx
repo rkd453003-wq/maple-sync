@@ -1,352 +1,231 @@
+// Sync dashboard: the health of the Shopify ↔ ERP integration at a glance.
 import { useEffect } from "react";
-import type {
-  ActionFunctionArgs,
-  HeadersFunction,
-  LoaderFunctionArgs,
-} from "react-router";
-import { useFetcher } from "react-router";
-import { useAppBridge } from "@shopify/app-bridge-react";
+import type { ActionFunctionArgs, LoaderFunctionArgs } from "react-router";
+import { Form, useLoaderData, useNavigation, useRevalidator } from "react-router";
 import { authenticate } from "../shopify.server";
-import { boundary } from "@shopify/shopify-app-react-router/server";
+import prisma from "../db.server";
+import { enqueue, retryJob } from "../queue.server";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  await authenticate.admin(request);
-
-  return null;
+const TYPE_LABELS: Record<string, string> = {
+  push_order: "Order → ERP",
+  pull_inventory: "Inventory ← ERP",
+  pull_fulfillments: "Fulfillment ← ERP",
 };
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
-  const color = ["Red", "Orange", "Yellow", "Green"][
-    Math.floor(Math.random() * 4)
-  ];
-  const response = await admin.graphql(
-    `#graphql
-      mutation populateProduct($product: ProductCreateInput!) {
-        productCreate(product: $product) {
-          product {
-            id
-            title
-            handle
-            status
-            variants(first: 10) {
-              edges {
-                node {
-                  id
-                  price
-                  barcode
-                  createdAt
-                }
-              }
-            }
-            demoInfo: metafield(namespace: "$app", key: "demo_info") {
-              jsonValue
-            }
-          }
-        }
-      }`,
-    {
-      variables: {
-        product: {
-          title: `${color} Snowboard`,
-          metafields: [
-            {
-              namespace: "$app",
-              key: "demo_info",
-              value: "Created by React Router Template",
-            },
-          ],
-        },
-      },
-    },
-  );
-  const responseJson = await response.json();
+const STATUS_TONES: Record<string, "success" | "critical" | "warning" | "info"> = {
+  succeeded: "success",
+  dead: "critical",
+  pending: "warning",
+  running: "info",
+};
 
-  const product = responseJson.data!.productCreate!.product!;
-  const variantId = product.variants.edges[0]!.node!.id!;
+export const loader = async ({ request }: LoaderFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
+  const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
-  const variantResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpdateVariant($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        productVariants {
-          id
-          price
-          barcode
-          createdAt
-        }
-      }
-    }`,
-    {
-      variables: {
-        productId: product.id,
-        variants: [{ id: variantId, price: "100.00" }],
-      },
-    },
-  );
+  // Four questions, asked of the database at the same time
+  const [counts, dead, recent, lastSuccess] = await Promise.all([
+    prisma.syncJob.groupBy({
+      by: ["status"],
+      where: { shop, updatedAt: { gte: since } },
+      _count: { _all: true },
+    }),
+    prisma.syncJob.findMany({
+      where: { shop, status: "dead" },
+      orderBy: { updatedAt: "desc" },
+      take: 20,
+    }),
+    prisma.syncJob.findMany({
+      where: { shop },
+      orderBy: { updatedAt: "desc" },
+      take: 25,
+    }),
+    prisma.syncJob.groupBy({
+      by: ["type"],
+      where: { shop, status: "succeeded" },
+      _max: { finishedAt: true },
+    }),
+  ]);
 
-  const variantResponseJson = await variantResponse.json();
-
-  const metaobjectResponse = await admin.graphql(
-    `#graphql
-    mutation shopifyReactRouterTemplateUpsertMetaobject($handle: MetaobjectHandleInput!, $values: JSON!) {
-      metaobjectUpsert(handle: $handle, values: $values) {
-        metaobject {
-          id
-          handle
-          values
-        }
-        userErrors {
-          field
-          message
-        }
-      }
-    }`,
-    {
-      variables: {
-        handle: {
-          type: "$app:example",
-          handle: "demo-entry",
-        },
-        values: {
-          title: "Demo Entry",
-          description:
-            "This metaobject was created by the Shopify app template to demonstrate the metaobject API.",
-        },
-      },
-    },
-  );
-
-  const metaobjectResponseJson = await metaobjectResponse.json();
+  const count = (status: string) => counts.find((c) => c.status === status)?._count._all ?? 0;
 
   return {
-    product: responseJson!.data!.productCreate!.product,
-    variant:
-      variantResponseJson!.data!.productVariantsBulkUpdate!.productVariants,
-    metaobject: metaobjectResponseJson!.data!.metaobjectUpsert!.metaobject,
+    stats: {
+      succeeded: count("succeeded"),
+      retrying: count("pending") + count("running"),
+      dead: count("dead"),
+    },
+    health: Object.keys(TYPE_LABELS).map((type) => ({
+      type,
+      lastSuccess: lastSuccess.find((l) => l.type === type)?._max.finishedAt ?? null,
+    })),
+    dead,
+    recent,
   };
 };
 
-export default function Index() {
-  const fetcher = useFetcher<typeof action>();
+export const action = async ({ request }: ActionFunctionArgs) => {
+  const { session } = await authenticate.admin(request);
+  const shop = session.shop;
+  const form = await request.formData();
+  const intent = form.get("intent");
 
-  const shopify = useAppBridge();
-  const isLoading =
-    ["loading", "submitting"].includes(fetcher.state) &&
-    fetcher.formMethod === "POST";
+  if (intent === "retry") {
+    await retryJob(String(form.get("id")), shop);
+  }
 
-  useEffect(() => {
-    if (fetcher.data?.product?.id) {
-      shopify.toast.show("Product created");
+  if (intent === "sync_now") {
+    // A unique dedupe key, so a manual sync is never mistaken for a duplicate
+    const key = `manual:${Date.now()}`;
+    await enqueue(shop, "pull_inventory", {}, `pull_inventory:${key}`);
+    await enqueue(shop, "pull_fulfillments", {}, `pull_fulfillments:${key}`);
+  }
+
+  return { ok: true };
+};
+
+// "3 min ago", "just now"…
+function timeAgo(value: Date | string | null) {
+  if (!value) return "Never";
+  const seconds = Math.round((Date.now() - new Date(value).getTime()) / 1000);
+  if (seconds < 10) return "just now";
+  if (seconds < 60) return `${seconds} sec ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} hr ago`;
+  return `${Math.round(seconds / 86400)} days ago`;
+}
+
+// A readable name for a job, e.g. "Order → ERP · #1003"
+function describe(job: { type: string; payload: string }) {
+  const label = TYPE_LABELS[job.type] ?? job.type;
+  if (job.type === "push_order") {
+    try {
+      return `${label} · ${JSON.parse(job.payload).name}`;
+    } catch {
+      return label;
     }
-  }, [fetcher.data?.product?.id, shopify]);
+  }
+  return label;
+}
 
-  const generateProduct = () => fetcher.submit({}, { method: "POST" });
+export default function SyncDashboard() {
+  const { stats, health, dead, recent } = useLoaderData<typeof loader>();
+  const navigation = useNavigation();
+  const revalidator = useRevalidator();
+  const busy = navigation.state !== "idle";
+
+  // Refresh the data every 5 seconds so the dashboard is live
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (revalidator.state === "idle") revalidator.revalidate();
+    }, 5_000);
+    return () => clearInterval(timer);
+  }, [revalidator]);
 
   return (
-    <s-page heading="Shopify app template">
-      <s-button slot="primary-action" onClick={generateProduct}>
-        Generate a product
-      </s-button>
-
-      <s-section heading="Congrats on creating a new Shopify app 🎉">
-        <s-paragraph>
-          This embedded app template uses{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/tools/app-bridge"
-            target="_blank"
-          >
-            App Bridge
-          </s-link>{" "}
-          interface examples like an{" "}
-          <s-link href="/app/additional">additional page in the app nav</s-link>
-          , as well as an{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            Admin GraphQL
-          </s-link>{" "}
-          mutation demo, to provide a starting point for app development.
-        </s-paragraph>
-      </s-section>
-      <s-section heading="Get started with products">
-        <s-paragraph>
-          Generate a product with GraphQL and get the JSON output for that
-          product. Learn more about the{" "}
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql/latest/mutations/productCreate"
-            target="_blank"
-          >
-            productCreate
-          </s-link>{" "}
-          mutation in our API references. Includes a product{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metafields"
-            target="_blank"
-          >
-            metafield
-          </s-link>{" "}
-          and{" "}
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data/metaobjects"
-            target="_blank"
-          >
-            metaobject
-          </s-link>
-          .
-        </s-paragraph>
+    <s-page heading="Sync dashboard">
+      <s-section heading="Last 24 hours">
         <s-stack direction="inline" gap="base">
-          <s-button
-            onClick={generateProduct}
-            {...(isLoading ? { loading: true } : {})}
-          >
-            Generate a product
-          </s-button>
-          {fetcher.data?.product && (
-            <s-button
-              onClick={() => {
-                shopify.intents.invoke?.("edit:shopify/Product", {
-                  value: fetcher.data?.product?.id,
-                });
-              }}
-              target="_blank"
-              variant="tertiary"
-            >
-              Edit product
-            </s-button>
-          )}
+          <s-box padding="base" border="base" borderRadius="base">
+            <s-text>Succeeded</s-text>
+            <s-heading>{stats.succeeded}</s-heading>
+          </s-box>
+          <s-box padding="base" border="base" borderRadius="base">
+            <s-text>Waiting to retry</s-text>
+            <s-heading>{stats.retrying}</s-heading>
+          </s-box>
+          <s-box padding="base" border="base" borderRadius="base">
+            <s-text>Dead (needs attention)</s-text>
+            <s-heading>{stats.dead}</s-heading>
+          </s-box>
         </s-stack>
-        {fetcher.data?.product && (
-          <s-section heading="productCreate mutation">
-            <s-stack direction="block" gap="base">
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.product, null, 2)}</code>
-                </pre>
-              </s-box>
+      </s-section>
 
-              <s-heading>productVariantsBulkUpdate mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>{JSON.stringify(fetcher.data.variant, null, 2)}</code>
-                </pre>
-              </s-box>
+      <s-section heading="Flow health">
+        <s-stack gap="base">
+          <s-table>
+            <s-table-header-row>
+              <s-table-header>Flow</s-table-header>
+              <s-table-header>Last successful sync</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {health.map((h) => (
+                <s-table-row key={h.type}>
+                  <s-table-cell>{TYPE_LABELS[h.type]}</s-table-cell>
+                  <s-table-cell>{timeAgo(h.lastSuccess)}</s-table-cell>
+                </s-table-row>
+              ))}
+            </s-table-body>
+          </s-table>
+          <Form method="post">
+            <input type="hidden" name="intent" value="sync_now" />
+            <s-button type="submit" variant="primary">
+              {busy ? "Queuing…" : "Sync now"}
+            </s-button>
+          </Form>
+        </s-stack>
+      </s-section>
 
-              <s-heading>metaobjectUpsert mutation</s-heading>
-              <s-box
-                padding="base"
-                borderWidth="base"
-                borderRadius="base"
-                background="subdued"
-              >
-                <pre
-                  style={{
-                    margin: 0,
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                  }}
-                >
-                  <code>
-                    {JSON.stringify(fetcher.data.metaobject, null, 2)}
-                  </code>
-                </pre>
-              </s-box>
-            </s-stack>
-          </s-section>
+      <s-section heading={`Dead-letter queue (${dead.length})`}>
+        {dead.length === 0 ? (
+          <s-paragraph>Nothing here. Every job has either succeeded or is still retrying.</s-paragraph>
+        ) : (
+          <s-table>
+            <s-table-header-row>
+              <s-table-header>Job</s-table-header>
+              <s-table-header>Attempts</s-table-header>
+              <s-table-header>Error</s-table-header>
+              <s-table-header>Failed</s-table-header>
+              <s-table-header>Action</s-table-header>
+            </s-table-header-row>
+            <s-table-body>
+              {dead.map((job) => (
+                <s-table-row key={job.id}>
+                  <s-table-cell>{describe(job)}</s-table-cell>
+                  <s-table-cell>{job.attempts}</s-table-cell>
+                  <s-table-cell>{job.lastError?.slice(0, 120)}</s-table-cell>
+                  <s-table-cell>{timeAgo(job.updatedAt)}</s-table-cell>
+                  <s-table-cell>
+                    <Form method="post">
+                      <input type="hidden" name="intent" value="retry" />
+                      <input type="hidden" name="id" value={job.id} />
+                      <s-button type="submit">Retry</s-button>
+                    </Form>
+                  </s-table-cell>
+                </s-table-row>
+              ))}
+            </s-table-body>
+          </s-table>
         )}
       </s-section>
 
-      <s-section slot="aside" heading="App template specs">
-        <s-paragraph>
-          <s-text>Framework: </s-text>
-          <s-link href="https://reactrouter.com/" target="_blank">
-            React Router
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Interface: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/app-home/using-polaris-components"
-            target="_blank"
-          >
-            Polaris web components
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>API: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/api/admin-graphql"
-            target="_blank"
-          >
-            GraphQL
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Custom data: </s-text>
-          <s-link
-            href="https://shopify.dev/docs/apps/build/custom-data"
-            target="_blank"
-          >
-            Metafields &amp; metaobjects
-          </s-link>
-        </s-paragraph>
-        <s-paragraph>
-          <s-text>Database: </s-text>
-          <s-link href="https://www.prisma.io/" target="_blank">
-            Prisma
-          </s-link>
-        </s-paragraph>
-      </s-section>
-
-      <s-section slot="aside" heading="Next steps">
-        <s-unordered-list>
-          <s-list-item>
-            Build an{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/getting-started/build-app-example"
-              target="_blank"
-            >
-              example app
-            </s-link>
-          </s-list-item>
-          <s-list-item>
-            Explore Shopify&apos;s API with{" "}
-            <s-link
-              href="https://shopify.dev/docs/apps/tools/graphiql-admin-api"
-              target="_blank"
-            >
-              GraphiQL
-            </s-link>
-          </s-list-item>
-        </s-unordered-list>
+      <s-section heading="Recent activity">
+        <s-table>
+          <s-table-header-row>
+            <s-table-header>Job</s-table-header>
+            <s-table-header>Status</s-table-header>
+            <s-table-header>Attempts</s-table-header>
+            <s-table-header>Last error</s-table-header>
+            <s-table-header>Updated</s-table-header>
+          </s-table-header-row>
+          <s-table-body>
+            {recent.map((job) => (
+              <s-table-row key={job.id}>
+                <s-table-cell>{describe(job)}</s-table-cell>
+                <s-table-cell>
+                  <s-badge tone={STATUS_TONES[job.status] ?? "info"}>{job.status}</s-badge>
+                </s-table-cell>
+                <s-table-cell>
+                  {job.attempts}/{job.maxAttempts}
+                </s-table-cell>
+                <s-table-cell>{job.lastError ? job.lastError.slice(0, 80) : "—"}</s-table-cell>
+                <s-table-cell>{timeAgo(job.updatedAt)}</s-table-cell>
+              </s-table-row>
+            ))}
+          </s-table-body>
+        </s-table>
       </s-section>
     </s-page>
   );
 }
-
-export const headers: HeadersFunction = (headersArgs) => {
-  return boundary.headers(headersArgs);
-};
