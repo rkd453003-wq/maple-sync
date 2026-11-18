@@ -2,7 +2,8 @@
   "name": "maple-sync",
   "private": true,
   "scripts": {
-        "erp": "tsx mock-erp/server.ts",
+    "erp": "tsx mock-erp/server.ts",
+    "test": "vitest run",
     "build": "react-router build",
     "dev": "shopify app dev",
     "config:link": "shopify app config link",
@@ -61,7 +62,8 @@
     "prettier": "^3.6.2",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
-    "vite": "^6.3.6"
+    "vite": "^6.3.6",
+    "vitest": "^5.1.1"
   },
   "workspaces": [
     "extensions/*"
